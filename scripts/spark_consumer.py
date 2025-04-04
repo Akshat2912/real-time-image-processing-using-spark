@@ -45,6 +45,9 @@ df = spark.readStream \
 
 df = df.selectExpr("CAST(value AS STRING)").withColumn("data", from_json(col("value"), schema)).select(col("data.image").alias("image"))
 
+# Frame counter (global across batches)
+frame_counter = {"count": 0}
+
 # **Use foreachBatch instead of foreach**
 def process_batch(batch_df, batch_id):
     """ Process each micro-batch in a loop """
@@ -52,6 +55,10 @@ def process_batch(batch_df, batch_id):
     for row in rows:
         if row.image is None:
             continue
+
+        # Increment global frame counter
+        frame_counter["count"] += 1
+        current_frame = frame_counter["count"]
 
         try:
             # Decode Base64
@@ -63,7 +70,7 @@ def process_batch(batch_df, batch_id):
 
             # YOLO Detection
             pred = model.predict(img, device='cuda', half=True, verbose=True)[0]
-            
+
             for value in pred.boxes:
                 box = list(value.xyxy[0].cpu())
                 prob = float(value.conf.cpu())
@@ -77,28 +84,31 @@ def process_batch(batch_df, batch_id):
                 x = int((box[0] + box[2]) / 2)
                 y = int((box[1] + box[3]) / 2)
 
-                # Save Image to HDFS
-                hdfs_path = f"{HDFS_IMAGE_DIR}frame_{timestamp.replace(':', '_')}.jpg"
-                local_path = f"/tmp/frame_{timestamp.replace(':', '_')}.jpg"
-                cv2.imwrite(local_path, img)
+                # Only save every 20th frame
+                if current_frame % 20 == 0:
+                    hdfs_path = f"{HDFS_IMAGE_DIR}frame_{timestamp.replace(':', '_')}.jpg"
+                    local_path = f"/tmp/frame_{timestamp.replace(':', '_')}.jpg"
+                    cv2.imwrite(local_path, img)
 
-                # Upload to HDFS
-                with open(local_path, 'rb') as f:
-                    hdfs_client.write(hdfs_path, f, overwrite=True)
-                
-                os.remove(local_path)
+                    # Upload to HDFS
+                    with open(local_path, 'rb') as f:
+                        hdfs_client.write(hdfs_path, f, overwrite=True)
+                    
+                    os.remove(local_path)
 
-                # Store metadata in HBase
-                row_key = f"{timestamp}_{clss}"
-                table.put(row_key.encode(), {
-                    b"info:timestamp": timestamp.encode(),
-                    b"info:class": str(clss).encode(),
-                    b"info:x": str(x).encode(),
-                    b"info:y": str(y).encode(),
-                    b"info:image_path": hdfs_path.encode()
-                })
+                    # Store metadata in HBase
+                    row_key = f"{timestamp}_{clss}"
+                    table.put(row_key.encode(), {
+                        b"info:timestamp": timestamp.encode(),
+                        b"info:class": str(clss).encode(),
+                        b"info:x": str(x).encode(),
+                        b"info:y": str(y).encode(),
+                        b"info:image_path": hdfs_path.encode()
+                    })
 
-                print(f"Stored in HBase: class={clss}, x={x}, y={y}, path={hdfs_path}")
+                    print(f"Stored in HBase: class={clss}, x={x}, y={y}, path={hdfs_path}")
+                else:
+                    print(f"Skipped frame {current_frame}")
 
             # Display image (optional)
             cv2.imshow("Received Image", img)
